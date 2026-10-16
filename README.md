@@ -1,5 +1,4 @@
-```markdown
-# Rustic Audio Tool
+# Rustic Audio
 
 `RusticAudio` is a Rust library for recording, processing, and playing back audio with support for DSP effects and Opus compression. It provides a simple API for handling audio files, including recording, playback, and encoding.
 
@@ -23,7 +22,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustic_audio_tool = "0.0.1"
+rustic_audio = { git = "https://github.com/katzenpost/rustic_audio" }
 ```
 
 ## Linux Debian/Ubuntu-based Dependencies Installation
@@ -31,19 +30,12 @@ rustic_audio_tool = "0.0.1"
 sudo apt-get install libasound2-dev pkg-config
 ```
 
-## Building For KatzenQT
-
-For the PyO3 module build used by `katzenqt`, see `BUILD.md` in this directory.
-That document covers prerequisites, the `cargo build` artifact path, and how
-`make rust-audio` from `katzenqt/` installs `rustic_audio_tool.so` into
-`katzenqt/src/katzenqt/audio/` for runtime loading.
-
 ## Usage
 
 ### Creating an Instance
 
 ```rust
-use rustic_audio_tool::RusticAudio;
+use rustic_audio::RusticAudio;
 
 let mut audio_tool = RusticAudio::new();
 ```
@@ -198,7 +190,7 @@ The `AudioProcessor` provides several configurable DSP settings to control audio
 You can customize the DSP settings by modifying the `AudioProcessor` instance:
 
 ```rust
-use rustic_audio_tool::AudioProcessor;
+use rustic_audio::AudioProcessor;
 
 let mut processor = AudioProcessor::new(48000.0); // Set sample rate to 48 kHz
 
@@ -242,7 +234,7 @@ The `OpusEncoder` provides configurable settings for encoding audio to the Opus 
 You can customize the Opus encoder settings by modifying the `OpusEncoder` instance:
 
 ```rust
-use rustic_audio_tool::OpusEncoder;
+use rustic_audio::OpusEncoder;
 
 let mut encoder = OpusEncoder::new();
 
@@ -282,4 +274,3 @@ The encoder automatically adds the following metadata to the Opus file:
 ## License
 
 This project is licensed under the GPLv3 License. See the LICENSE file for details.
-```

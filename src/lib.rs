@@ -4,8 +4,6 @@ mod dsp;
 mod opus_encoder;
 mod opus_playback;
 mod voice_note;
-#[cfg(feature = "python")]
-mod python;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

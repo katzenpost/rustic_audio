@@ -1,4 +1,4 @@
-use rustic_audio_tool::RusticAudio;
+use rustic_audio::RusticAudio;
 use std::env;
 
 fn main() {
