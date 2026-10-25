@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["DSP", "voice", "record", "audio", "clean"]
 categories = ["multimedia::audio"]
 edition = "2021"
+rust-version = "1.87"
 
 [dependencies]
 # Cross-Platform Audio Library
@@ -24,7 +25,7 @@ rustfft = "6.1.0"
 realfft = "3.3.0"
 
 # pure Rust Opus codec
-opus-rs = "0.1.22"
+opus-rs = "=0.1.22"
 
 # reading and writing Ogg container files.
 ogg = "0.9.2"
@@ -33,6 +34,3 @@ ogg = "0.9.2"
 name = "rustic_audio"
 path = "src/lib.rs"
 crate-type = ["rlib"]
-
-[patch.crates-io]
-opus-rs = { path = "vendor/opus-rs" }

@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Publishes rustic_audio to crates.io when a tag vX.Y.Z naming the version in Cargo.toml is
+# pushed, with crates.io's trusted publishing: crates.io trusts this workflow of this repository,
+# so no token is stored. Pull requests test and package the crate without publishing it.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: the tag is the crate's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ours=v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "tag $GITHUB_REF_NAME, Cargo.toml $ours"
+          [ "$GITHUB_REF_NAME" = "$ours" ]
+      - run: cargo test --locked
+      - run: cargo publish --locked --dry-run
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
