@@ -453,6 +453,8 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "opus-rs"
 version = "0.1.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28911d75055df30f4e6203424619fd81d6435c5d63a9d9942968848db545f3b9"
 
 [[package]]
 name = "pin-project-lite"
