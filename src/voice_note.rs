@@ -1,7 +1,9 @@
 use crate::dsp::AudioProcessor;
 use crate::opus_encoder::OpusEncoder;
-use crate::opus_playback::{get_opus_info, playback_opus};
-use crate::record::record_audio;
+use crate::opus_playback::{get_opus_info, playback, ClipSource};
+use crate::opus_encoder::encode_in_memory;
+use crate::record::{clean_up, record_audio, record_to_memory};
+use crate::secure::SecureVec;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,10 +33,32 @@ impl VoiceNoteClip {
     }
 }
 
+/// A voice note recorded into guarded memory, never written to a file: Ogg Opus at 48 kHz, as
+/// [`VoiceNoteEngine::stop_capture`] writes it.
+pub struct VoiceClip {
+    bytes: SecureVec<u8>,
+    duration_seconds: f64,
+}
+
+impl VoiceClip {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn duration_seconds(&self) -> f64 {
+        self.duration_seconds
+    }
+}
+
+enum Captured {
+    File(VoiceNoteClip),
+    Memory(VoiceClip),
+}
+
 struct RecordingJob {
     is_recording: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
-    handle: thread::JoinHandle<Result<VoiceNoteClip, String>>,
+    handle: thread::JoinHandle<Result<Captured, String>>,
 }
 
 struct PlaybackJob {
@@ -127,11 +151,11 @@ impl VoiceNoteEngine {
             let (file_size_bytes, duration_seconds) =
                 get_opus_info(&opus_path_str).map_err(|err| err.to_string())?;
 
-            Ok(VoiceNoteClip {
+            Ok(Captured::File(VoiceNoteClip {
                 path: opus_path_for_thread,
                 duration_seconds,
                 file_size_bytes,
-            })
+            }))
         });
 
         self.recording = Some(RecordingJob {
@@ -143,7 +167,61 @@ impl VoiceNoteEngine {
         Ok(opus_path)
     }
 
+    /// Start recording a voice note into guarded memory; nothing is written to a file. It is
+    /// had with [`VoiceNoteEngine::stop_capture_in_memory`].
+    pub fn start_capture_in_memory(&mut self) -> Result<(), String> {
+        if self.is_recording() {
+            return Err("capture is already active".to_string());
+        }
+
+        self.stop_playback()?;
+
+        let processor = self.processor.clone();
+        let opus_encoder = self.opus_encoder.clone();
+        let is_recording = Arc::new(AtomicBool::new(true));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let recording_flag = Arc::clone(&is_recording);
+        let cancel_flag = Arc::clone(&cancel_requested);
+
+        let handle = thread::spawn(move || {
+            let (mut samples, rate) = record_to_memory(recording_flag).map_err(|err| err.to_string())?;
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err("recording cancelled".to_string());
+            }
+            clean_up(&mut samples, rate, &processor);
+            let (bytes, duration_seconds) = encode_in_memory(&opus_encoder, &samples, rate)?;
+            Ok(Captured::Memory(VoiceClip {
+                bytes,
+                duration_seconds,
+            }))
+        });
+
+        self.recording = Some(RecordingJob {
+            is_recording,
+            cancel_requested,
+            handle,
+        });
+        Ok(())
+    }
+
     pub fn stop_capture(&mut self) -> Result<VoiceNoteClip, String> {
+        match self.stop_recording()? {
+            Captured::File(clip) => Ok(clip),
+            Captured::Memory(_) => Err("capture is in memory".to_string()),
+        }
+    }
+
+    pub fn stop_capture_in_memory(&mut self) -> Result<VoiceClip, String> {
+        match self.stop_recording()? {
+            Captured::Memory(clip) => Ok(clip),
+            Captured::File(clip) => {
+                let _ = fs::remove_file(clip.path());
+                Err("capture is to a file".to_string())
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) -> Result<Captured, String> {
         let recording = self
             .recording
             .take()
@@ -167,10 +245,11 @@ impl VoiceNoteEngine {
         recording.is_recording.store(false, Ordering::Relaxed);
 
         match recording.handle.join() {
-            Ok(Ok(clip)) => {
+            Ok(Ok(Captured::File(clip))) => {
                 let _ = fs::remove_file(clip.path());
                 Ok(true)
             }
+            Ok(Ok(Captured::Memory(_))) => Ok(true),
             Ok(Err(err)) if err == "recording cancelled" => Ok(true),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("failed to join capture thread".to_string()),
@@ -183,6 +262,12 @@ impl VoiceNoteEngine {
 
     pub fn play_received(&mut self, file_path: impl AsRef<Path>) -> Result<(), String> {
         self.play_clip(file_path)
+    }
+
+    /// Play a received clip held in memory, such as one decrypted for playing that should never
+    /// be written out.
+    pub fn play_received_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.start_playback(ClipSource::Bytes(bytes))
     }
 
     pub fn stop_playback(&mut self) -> Result<(), String> {
@@ -231,13 +316,22 @@ impl VoiceNoteEngine {
             ));
         }
 
-        let play_path = file_path.to_string_lossy().into_owned();
+        self.start_playback(ClipSource::File(file_path.to_string_lossy().into_owned()))
+    }
+
+    fn start_playback(&mut self, clip: ClipSource) -> Result<(), String> {
+        if self.is_recording() {
+            return Err("capture is active".to_string());
+        }
+
+        self.stop_playback()?;
+
         let is_playing = Arc::new(AtomicBool::new(true));
         let playback_flag = Arc::clone(&is_playing);
         let last_error = Arc::new(Mutex::new(None));
         let playback_error = Arc::clone(&last_error);
         let handle = thread::spawn(move || {
-            if let Err(err) = playback_opus(&play_path, playback_flag) {
+            if let Err(err) = playback(clip, playback_flag) {
                 store_playback_error(playback_error.as_ref(), err);
             }
         });

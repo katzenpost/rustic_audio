@@ -2,6 +2,9 @@ use ogg::{PacketWriter, writing::PacketWriteEndInfo};
 use opus_rs::{Application, OpusEncoder as CodecEncoder};
 use std::fs::File;
 use std::io::BufWriter;
+use zeroize::Zeroize;
+
+use crate::secure::SecureVec;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpusEncodingMode {
@@ -194,6 +197,147 @@ impl OpusEncoder {
     }
 }
 
+/// Encode mono samples at `rate` Hz as Ogg Opus at 48 kHz, as [`OpusEncoder::encode_wav_to_opus`]
+/// does, but in memory: the samples, the frames and the stream never leave guarded memory or the
+/// stack, which is wiped. Returns the stream and its length in seconds.
+pub(crate) fn encode_in_memory(
+    encoder: &OpusEncoder,
+    samples: &[f32],
+    rate: u32,
+) -> Result<(SecureVec<u8>, f64), String> {
+    if samples.len() < 2 {
+        return Err("nothing was recorded".to_string());
+    }
+    let mut codec = CodecEncoder::new(48_000, 1, Application::Audio).map_err(|err| err.to_string())?;
+    codec.bitrate_bps = encoder.bitrate;
+    codec.use_cbr = matches!(encoder.mode, OpusEncodingMode::Cbr);
+    codec.complexity = encoder.vbr_quality;
+
+    let mut out = SecureVec::new();
+    let mut pages = OggPages::new(content_serial(samples));
+    let mut head = [0u8; 19];
+    head[..8].copy_from_slice(b"OpusHead");
+    head[8] = 1; // version
+    head[9] = 1; // channels
+    head[12..16].copy_from_slice(&48_000u32.to_le_bytes());
+    pages.page(&mut out, &[&head], 0, BOS);
+    pages.page(&mut out, &[b"OpusTags\0\0\0\0\0\0\0\0"], 0, 0);
+
+    // Linear resampling to 48 kHz, frame by frame.
+    let out_len = if rate == 48_000 {
+        samples.len()
+    } else {
+        (samples.len() as f64 / rate as f64 * 48_000.0) as usize
+    };
+    let scale = (samples.len() - 1) as f64 / (out_len.max(2) - 1) as f64;
+    let at = |i: usize| -> f32 {
+        if rate == 48_000 {
+            return samples[i];
+        }
+        let pos = i as f64 * scale;
+        let index = pos as usize;
+        let frac = (pos - index as f64) as f32;
+        match samples.get(index + 1) {
+            Some(&next) => samples[index] * (1.0 - frac) + next * frac,
+            None => samples[index],
+        }
+    };
+
+    const FRAME: usize = 960;
+    let mut frame = [0f32; FRAME];
+    let mut packet = [0u8; 1275];
+    let mut pending = SecureVec::<u8>::new();
+    let mut lengths: Vec<usize> = Vec::new();
+    let frames = out_len.div_ceil(FRAME);
+    let mut granule = 0u64;
+    let result: Result<(), String> = (|| {
+        for f in 0..frames {
+            for (k, x) in frame.iter_mut().enumerate() {
+                let i = f * FRAME + k;
+                *x = if i < out_len { at(i) } else { 0.0 };
+            }
+            let n = codec
+                .encode(&frame, FRAME, &mut packet)
+                .map_err(|err| err.to_string())?;
+            pending.extend_from_slice(&packet[..n]);
+            lengths.push(n);
+            granule += FRAME as u64;
+            let last = f + 1 == frames;
+            // A page of a second or so, and the last one marked as the end.
+            if lengths.len() == 50 || last {
+                let mut parts = Vec::with_capacity(lengths.len());
+                let mut start = 0;
+                for &n in &lengths {
+                    parts.push(&pending[start..start + n]);
+                    start += n;
+                }
+                pages.page(&mut out, &parts, granule, if last { EOS } else { 0 });
+                drop(parts);
+                pending = SecureVec::new();
+                lengths.clear();
+            }
+        }
+        Ok(())
+    })();
+    frame.zeroize();
+    packet.zeroize();
+    result?;
+    Ok((out, granule as f64 / 48_000.0))
+}
+
+const BOS: u8 = 0x02;
+const EOS: u8 = 0x04;
+
+/// Ogg pages of one logical stream, written straight into guarded memory.
+struct OggPages {
+    serial: u32,
+    sequence: u32,
+}
+
+impl OggPages {
+    fn new(serial: u32) -> Self {
+        Self { serial, sequence: 0 }
+    }
+
+    /// One page holding `packets` whole, each of them ending on it.
+    fn page(&mut self, out: &mut SecureVec<u8>, packets: &[&[u8]], granule: u64, flags: u8) {
+        let mut lacing: Vec<u8> = Vec::new();
+        for p in packets {
+            lacing.extend(std::iter::repeat_n(255u8, p.len() / 255));
+            lacing.push((p.len() % 255) as u8);
+        }
+        assert!(lacing.len() <= 255, "too many packets for one Ogg page");
+        let start = out.len();
+        out.extend_from_slice(b"OggS");
+        out.push(0);
+        out.push(flags);
+        out.extend_from_slice(&granule.to_le_bytes());
+        out.extend_from_slice(&self.serial.to_le_bytes());
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.push(lacing.len() as u8);
+        out.extend_from_slice(&lacing);
+        for p in packets {
+            out.extend_from_slice(p);
+        }
+        let crc = ogg_crc(&out[start..]);
+        out[start + 22..start + 26].copy_from_slice(&crc.to_le_bytes());
+        self.sequence += 1;
+    }
+}
+
+/// Ogg's CRC-32: polynomial 0x04c11db7, not reflected, starting from zero.
+fn ogg_crc(bytes: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &b in bytes {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04c1_1db7 } else { crc << 1 };
+        }
+    }
+    crc
+}
+
 fn content_serial(samples: &[f32]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for sample in samples {
@@ -213,6 +357,65 @@ mod tests {
     use std::fs;
     use std::io::BufReader;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn in_memory_matches_the_file_encoder() {
+        // Two and a half seconds of a 440 Hz tone at 44.1 kHz: several pages, resampled.
+        let rate = 44_100;
+        let samples: Vec<f32> = (0..rate * 5 / 2)
+            .map(|n| (n as f32 / rate as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.25)
+            .collect();
+        let (bytes, seconds) = super::encode_in_memory(&OpusEncoder::new(), &samples, rate as u32).unwrap();
+        assert!(bytes.is_guarded());
+        assert!((seconds - 2.5).abs() < 0.03, "{seconds}");
+
+        let unique_suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("rustic-audio-memory-test-{unique_suffix}"));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let wav_path = temp_dir.join("test.wav");
+        let opus_path = temp_dir.join("test.opus");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: rate as u32,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(&wav_path, spec).unwrap();
+        for &x in &samples {
+            writer.write_sample(x).unwrap();
+        }
+        writer.finalize().unwrap();
+        OpusEncoder::new()
+            .encode_wav_to_opus(wav_path.to_str().unwrap(), opus_path.to_str().unwrap())
+            .unwrap();
+
+        // Every page's checksum is checked as it is read.
+        let packets = |reader: &mut PacketReader<_>| {
+            let mut out = Vec::new();
+            while let Some(p) = reader.read_packet().unwrap() {
+                out.push((p.last_in_stream(), p.absgp_page(), p.data));
+            }
+            out
+        };
+        let mine = packets(&mut PacketReader::new(std::io::Cursor::new(bytes.to_vec())));
+        let theirs = packets(&mut PacketReader::new(std::io::Cursor::new(fs::read(&opus_path).unwrap())));
+        assert_eq!(mine.len(), theirs.len());
+        assert_eq!(mine[0].2, theirs[0].2, "the same OpusHead");
+        assert!(mine.last().unwrap().0, "the stream ends");
+        assert_eq!(mine.last().unwrap().1, theirs.last().unwrap().1, "the same length");
+        assert!(mine.len() > 100);
+        // Mostly the same packets: the file encoder rounds to 16 bits in between.
+        let same = mine.iter().zip(&theirs).skip(2).filter(|(a, b)| a.2.len() == b.2.len()).count();
+        assert!(same * 10 >= (mine.len() - 2) * 9, "{same} of {}", mine.len() - 2);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn ogg_crc_of_a_known_page() {
+        // "OggS" and nothing else is not a page, but its checksum is fixed.
+        assert_eq!(super::ogg_crc(b"OggS"), 0x5fb0a94f);
+        assert_eq!(super::ogg_crc(b""), 0);
+    }
 
     #[test]
     fn encode_wav_to_opus_does_not_write_trailing_empty_packet() {

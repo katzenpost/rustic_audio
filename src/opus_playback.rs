@@ -2,7 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ogg::reading::PacketReader;
 use opus_rs::OpusDecoder;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor, Read, Seek};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -43,7 +43,33 @@ pub fn get_opus_info(file_path: &str) -> Result<(u64, f64), Box<dyn std::error::
     Ok((file_size, duration))
 }
 
+/// Where a clip to play is: a file, or bytes already in memory, such as a clip decrypted for
+/// playing that should never be written out.
+pub(crate) enum ClipSource {
+    File(String),
+    Bytes(Vec<u8>),
+}
+
+trait ClipReader: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> ClipReader for T {}
+
+impl ClipSource {
+    fn reader(self) -> Result<Box<dyn ClipReader>, String> {
+        match self {
+            ClipSource::File(path) => Ok(Box::new(BufReader::new(
+                File::open(path).map_err(|err| err.to_string())?,
+            ))),
+            ClipSource::Bytes(bytes) => Ok(Box::new(Cursor::new(bytes))),
+        }
+    }
+}
+
 pub fn playback_opus(file_path: &str, is_playing_flag: Arc<AtomicBool>) -> Result<(), String> {
+    playback(ClipSource::File(file_path.to_string()), is_playing_flag)
+}
+
+pub(crate) fn playback(clip: ClipSource, is_playing_flag: Arc<AtomicBool>) -> Result<(), String> {
     let host = cpal::default_host();
     let device = host.default_output_device()
         .ok_or_else(|| "Failed to get default output device".to_string())?;
@@ -60,7 +86,7 @@ pub fn playback_opus(file_path: &str, is_playing_flag: Arc<AtomicBool>) -> Resul
     let producer_state = Arc::new(AtomicU8::new(PRODUCER_RUNNING));
     let producer_error = Arc::new(Mutex::new(None));
     let producer_handle = spawn_frame_producer(
-        file_path,
+        clip,
         frame_tx,
         Arc::clone(&is_playing_flag),
         Arc::clone(&producer_state),
@@ -191,15 +217,17 @@ pub fn playback_opus(file_path: &str, is_playing_flag: Arc<AtomicBool>) -> Resul
 } 
 
 fn spawn_frame_producer(
-    file_path: &str,
+    clip: ClipSource,
     frame_tx: SyncSender<PcmFrame>,
     is_playing: Arc<AtomicBool>,
     producer_state: Arc<AtomicU8>,
     producer_error: Arc<Mutex<Option<String>>>,
 ) -> thread::JoinHandle<()> {
-    let file_path = file_path.to_string();
     thread::spawn(move || {
-        match produce_frames(&file_path, frame_tx, is_playing) {
+        match clip
+            .reader()
+            .and_then(|reader| produce_frames(reader, frame_tx, is_playing))
+        {
             Ok(()) => producer_state.store(PRODUCER_COMPLETED, Ordering::Relaxed),
             Err(err) => {
                 store_error_once(producer_error.as_ref(), err);
@@ -210,13 +238,12 @@ fn spawn_frame_producer(
 }
 
 fn produce_frames(
-    file_path: &str,
+    reader: impl Read + Seek,
     frame_tx: SyncSender<PcmFrame>,
     is_playing: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut decoder = OpusDecoder::new(SAMPLE_RATE as i32, 1).map_err(|err| err.to_string())?;
-    let file = BufReader::new(File::open(file_path).map_err(|err| err.to_string())?);
-    let mut packet_reader = PacketReader::new(file);
+    let mut packet_reader = PacketReader::new(reader);
     let mut decode_buffer = vec![0f32; FRAME_SIZE];
 
     packet_reader
@@ -331,7 +358,7 @@ fn take_error(slot: &Mutex<Option<String>>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_frame_to_output, produce_frames};
+    use super::{copy_frame_to_output, produce_frames, ClipSource};
     use crate::opus_encoder::OpusEncoder;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::fs;
@@ -376,7 +403,9 @@ mod tests {
         let (frame_tx, frame_rx) = sync_channel(8);
         let is_playing = Arc::new(AtomicBool::new(true));
         produce_frames(
-            opus_path.to_str().unwrap(),
+            ClipSource::File(opus_path.to_str().unwrap().to_string())
+                .reader()
+                .unwrap(),
             frame_tx,
             Arc::clone(&is_playing),
         )
@@ -387,6 +416,60 @@ mod tests {
             frame_count > 0,
             "expected at least one decoded audio frame, got {frame_count}"
         );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn clip_in_memory_decodes_as_from_file() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rustic-audio-bytes-test-{unique_suffix}"
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let wav_path = temp_dir.join("test.wav");
+        let opus_path = temp_dir.join("test.opus");
+
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(&wav_path, spec).unwrap();
+        for n in 0..(960 * 10) {
+            let t = n as f32 / 48_000.0;
+            writer
+                .write_sample(((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+
+        OpusEncoder::new()
+            .encode_wav_to_opus(
+                wav_path.to_str().unwrap(),
+                opus_path.to_str().unwrap(),
+            )
+            .unwrap();
+
+        let frames = |clip: ClipSource| {
+            let (frame_tx, frame_rx) = sync_channel(64);
+            produce_frames(
+                clip.reader().unwrap(),
+                frame_tx,
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+            frame_rx.iter().collect::<Vec<_>>()
+        };
+        let from_file = frames(ClipSource::File(opus_path.to_str().unwrap().to_string()));
+        let from_bytes = frames(ClipSource::Bytes(fs::read(&opus_path).unwrap()));
+        assert!(from_file.len() >= 5, "got {} frames", from_file.len());
+        assert_eq!(from_bytes, from_file);
 
         let _ = fs::remove_dir_all(temp_dir);
     }

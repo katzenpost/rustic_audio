@@ -4,6 +4,7 @@ mod dsp;
 mod opus_encoder;
 mod opus_playback;
 mod voice_note;
+mod secure;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,7 +17,8 @@ use crate::opus_playback::playback_opus;
 // Keep these re-exports for public use
 pub use crate::dsp::AudioProcessor;
 pub use crate::opus_encoder::{OpusEncoder, OpusEncodingMode};
-pub use crate::voice_note::{VoiceNoteClip, VoiceNoteEngine};
+pub use crate::secure::SecureVec;
+pub use crate::voice_note::{VoiceClip, VoiceNoteClip, VoiceNoteEngine};
 
 #[derive(Clone)]
 pub struct AudioFileInfo {

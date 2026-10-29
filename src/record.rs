@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::error::Error;
 use crate::dsp::AudioProcessor;
+use crate::secure::SecureVec;
 
 pub fn record_audio(file_path: &str, is_recording_flag: Arc<AtomicBool>, processor: AudioProcessor) -> Result<(), Box<dyn Error>> {
     let output_path = Path::new(file_path);
@@ -232,7 +233,7 @@ pub fn record_audio(file_path: &str, is_recording_flag: Arc<AtomicBool>, process
 }
 
 // Add this new function for RMS normalization with peak limiting
-fn normalize_audio_rms(samples: &mut Vec<f32>, target_rms_db: f32) {
+fn normalize_audio_rms(samples: &mut [f32], target_rms_db: f32) {
     // Calculate current RMS
     let rms_current = (samples.iter().map(|&x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
     let rms_current_db = 20.0 * rms_current.log10();
@@ -272,7 +273,7 @@ fn normalize_audio_rms(samples: &mut Vec<f32>, target_rms_db: f32) {
 }
 
 // Add this new function for the highpass filter
-fn apply_highpass_filter(samples: &mut Vec<f32>, cutoff_hz: f32, sample_rate: f32) {
+fn apply_highpass_filter(samples: &mut [f32], cutoff_hz: f32, sample_rate: f32) {
     println!("Applying highpass filter at {} Hz", cutoff_hz);
     
     // Calculate filter coefficients (first-order highpass)
@@ -307,4 +308,83 @@ fn apply_highpass_filter(samples: &mut Vec<f32>, cutoff_hz: f32, sample_rate: f3
     println!("  DC offset before: {:.6}", dc_before);
     println!("  DC offset after: {:.6}", dc_after);
     println!("  Final DC offset: {:.6}", samples.iter().sum::<f32>() / samples.len() as f32);
+}
+
+/// Record from the default input until `is_recording` is cleared, into guarded memory and never
+/// to a file: the first channel only, as samples from -1 to 1. Returns them and their rate.
+pub fn record_to_memory(is_recording_flag: Arc<AtomicBool>) -> Result<(SecureVec<f32>, u32), Box<dyn Error>> {
+    let host = cpal::default_host();
+    let device = host.default_input_device().ok_or("no audio input device")?;
+    let config = device.default_input_config()?;
+    let sample_format = config.sample_format();
+    let channels = config.channels().max(1) as usize;
+    let rate = config.sample_rate();
+    let config = config.config();
+
+    let samples = Arc::new(Mutex::new(SecureVec::<f32>::new()));
+    fn keep<T: Copy>(samples: &Mutex<SecureVec<f32>>, data: &[T], channels: usize, to_f32: impl Fn(T) -> f32) {
+        if let Ok(mut s) = samples.lock() {
+            s.reserve(data.len() / channels);
+            for frame in data.chunks(channels) {
+                s.push(to_f32(frame[0]));
+            }
+        }
+    }
+    let stream = {
+        let samples = Arc::clone(&samples);
+        let recording = Arc::clone(&is_recording_flag);
+        let err = |err| eprintln!("Stream error: {:?}", err);
+        match sample_format {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    if recording.load(Ordering::Relaxed) {
+                        keep(&samples, data, channels, |x| x);
+                    }
+                },
+                err,
+                None,
+            )?,
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    if recording.load(Ordering::Relaxed) {
+                        keep(&samples, data, channels, |x| x as f32 / 32768.0);
+                    }
+                },
+                err,
+                None,
+            )?,
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    if recording.load(Ordering::Relaxed) {
+                        keep(&samples, data, channels, |x| (x as f32 - 32768.0) / 32768.0);
+                    }
+                },
+                err,
+                None,
+            )?,
+            _ => return Err("Unsupported sample format".into()),
+        }
+    };
+    stream.play()?;
+    while is_recording_flag.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stream);
+    let samples = std::mem::take(&mut *samples.lock().map_err(|_| "recording poisoned")?);
+    Ok((samples, rate))
+}
+
+/// Clean up a recording as [`record_audio`] does, in place: a highpass filter at 20 Hz, no DC
+/// offset, and RMS normalisation if the processor asks for it.
+pub fn clean_up(samples: &mut [f32], rate: u32, processor: &AudioProcessor) {
+    if samples.len() < 2 {
+        return;
+    }
+    apply_highpass_filter(samples, 20.0, rate as f32);
+    if processor.rms_enabled {
+        normalize_audio_rms(samples, processor.rms_target_db);
+    }
 }
