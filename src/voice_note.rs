@@ -1,6 +1,6 @@
 use crate::dsp::AudioProcessor;
 use crate::opus_encoder::OpusEncoder;
-use crate::opus_playback::{get_opus_info, playback_opus};
+use crate::opus_playback::{get_opus_info, playback, ClipSource};
 use crate::record::record_audio;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,12 @@ impl VoiceNoteEngine {
         self.play_clip(file_path)
     }
 
+    /// Play a received clip held in memory, such as one decrypted for playing that should never
+    /// be written out.
+    pub fn play_received_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.start_playback(ClipSource::Bytes(bytes))
+    }
+
     pub fn stop_playback(&mut self) -> Result<(), String> {
         let playback = match self.playback.take() {
             Some(playback) => playback,
@@ -231,13 +237,22 @@ impl VoiceNoteEngine {
             ));
         }
 
-        let play_path = file_path.to_string_lossy().into_owned();
+        self.start_playback(ClipSource::File(file_path.to_string_lossy().into_owned()))
+    }
+
+    fn start_playback(&mut self, clip: ClipSource) -> Result<(), String> {
+        if self.is_recording() {
+            return Err("capture is active".to_string());
+        }
+
+        self.stop_playback()?;
+
         let is_playing = Arc::new(AtomicBool::new(true));
         let playback_flag = Arc::clone(&is_playing);
         let last_error = Arc::new(Mutex::new(None));
         let playback_error = Arc::clone(&last_error);
         let handle = thread::spawn(move || {
-            if let Err(err) = playback_opus(&play_path, playback_flag) {
+            if let Err(err) = playback(clip, playback_flag) {
                 store_playback_error(playback_error.as_ref(), err);
             }
         });
