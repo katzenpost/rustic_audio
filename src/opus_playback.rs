@@ -10,7 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 const SAMPLE_RATE: u32 = 48_000;
-const FRAME_SIZE: usize = 960;
+// The longest packet Opus allows: 120 ms.
+const MAX_PACKET_SAMPLES: usize = 5760;
 const FRAME_QUEUE_CAPACITY: usize = 8;
 const STARTUP_FRAME_WAIT: Duration = Duration::from_secs(1);
 
@@ -32,15 +33,32 @@ pub fn get_opus_info(file_path: &str) -> Result<(u64, f64), Box<dyn std::error::
     packet_reader.read_packet()?; // OpusHead
     packet_reader.read_packet()?; // OpusTags
 
-    let mut packet_count = 0;
-    while let Ok(Some(_)) = packet_reader.read_packet() {
-        packet_count += 1;
+    let mut samples = 0;
+    while let Ok(Some(packet)) = packet_reader.read_packet() {
+        samples += packet_samples(&packet.data).unwrap_or(0);
     }
-
-    // Each packet is 20ms of audio
-    let duration = (packet_count as f64) * 0.02;
+    let duration = samples as f64 / SAMPLE_RATE as f64;
 
     Ok((file_size, duration))
+}
+
+/// Samples at 48 kHz in an Opus packet, from its TOC byte (RFC 6716 3.1), or `None` if it is
+/// not a legal packet.
+fn packet_samples(packet: &[u8]) -> Option<usize> {
+    let toc = *packet.first()?;
+    let config = (toc >> 3) as usize;
+    let per_frame = match config {
+        0..=11 => [480, 960, 1920, 2880][config & 3], // SILK
+        12..=15 => [480, 960][config & 1],            // Hybrid
+        _ => [120, 240, 480, 960][config & 3],        // CELT
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => (*packet.get(1)? & 0x3f) as usize,
+    };
+    let samples = per_frame * frames;
+    (frames > 0 && samples <= MAX_PACKET_SAMPLES).then_some(samples)
 }
 
 /// Where a clip to play is: a file, or bytes already in memory, such as a clip decrypted for
@@ -244,7 +262,7 @@ fn produce_frames(
 ) -> Result<(), String> {
     let mut decoder = OpusDecoder::new(SAMPLE_RATE as i32, 1).map_err(|err| err.to_string())?;
     let mut packet_reader = PacketReader::new(reader);
-    let mut decode_buffer = vec![0f32; FRAME_SIZE];
+    let mut decode_buffer = vec![0f32; MAX_PACKET_SAMPLES];
 
     packet_reader
         .read_packet()
@@ -260,7 +278,8 @@ fn produce_frames(
         if packet.data.is_empty() {
             continue;
         }
-        let n_samples = match decoder.decode(&packet.data, FRAME_SIZE, &mut decode_buffer) {
+        let frame_size = packet_samples(&packet.data).ok_or("invalid Opus packet")?;
+        let n_samples = match decoder.decode(&packet.data, frame_size, &mut decode_buffer) {
             Ok(n_samples) => n_samples,
             Err("Input packet empty") => continue,
             Err(err) => return Err(err.to_string()),
@@ -361,6 +380,7 @@ mod tests {
     use super::{copy_frame_to_output, produce_frames, ClipSource};
     use crate::opus_encoder::OpusEncoder;
     use hound::{SampleFormat, WavSpec, WavWriter};
+    use ogg::writing::PacketWriteEndInfo;
     use std::fs;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
@@ -472,6 +492,79 @@ mod tests {
         assert_eq!(from_bytes, from_file);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// One second of a 440 Hz tone encoded by libopus at 8 kbit/s (tests/data/make_opus_fixtures.py),
+    /// wrapped in Ogg as a clip is, decoded to its samples.
+    fn decode_libopus_tone(fixture: &[u8]) -> (usize, Vec<f32>) {
+        let mut ogg = Vec::new();
+        let mut writer = ogg::PacketWriter::new(std::io::Cursor::new(&mut ogg));
+        let head = b"OpusHead\x01\x01\0\0\x80\xbb\0\0\0\0\0".to_vec();
+        writer.write_packet(head, 1, PacketWriteEndInfo::EndPage, 0).unwrap();
+        writer
+            .write_packet(b"OpusTags\0\0\0\0\0\0\0\0".to_vec(), 1, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+        let mut packets = Vec::new();
+        let mut rest = fixture;
+        while !rest.is_empty() {
+            let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+            packets.push(rest[2..2 + len].to_vec());
+            rest = &rest[2 + len..];
+        }
+        let count = packets.len();
+        for (i, packet) in packets.into_iter().enumerate() {
+            let end = if i + 1 == count {
+                PacketWriteEndInfo::EndStream
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            writer.write_packet(packet, 1, end, 0).unwrap();
+        }
+        drop(writer);
+
+        let (frame_tx, frame_rx) = sync_channel(256);
+        produce_frames(
+            ClipSource::Bytes(ogg).reader().unwrap(),
+            frame_tx,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        (count, frame_rx.iter().flatten().collect())
+    }
+
+    fn assert_plays_tone(fixture: &[u8], samples_per_packet: usize) {
+        let (packets, pcm) = decode_libopus_tone(fixture);
+        assert_eq!(pcm.len(), packets * samples_per_packet);
+        // After the codec settles, the tone is there: most energy at 440 Hz (Goertzel).
+        let tail = &pcm[pcm.len() / 4..];
+        let k = 2.0 * (std::f32::consts::TAU * 440.0 / 48_000.0).cos();
+        let (mut s1, mut s2) = (0f32, 0f32);
+        for &x in tail {
+            (s1, s2) = (x + k * s1 - s2, s1);
+        }
+        let tone = (s1 * s1 + s2 * s2 - k * s1 * s2) * 2.0 / tail.len() as f32;
+        let energy = tail.iter().map(|x| x * x).sum::<f32>();
+        assert!(tone > 0.5 * energy, "tone {tone} of energy {energy}");
+    }
+
+    #[test]
+    fn plays_libopus_20ms_frames() {
+        assert_plays_tone(include_bytes!("../tests/data/tone_20ms.bin"), 960);
+    }
+
+    #[test]
+    fn plays_libopus_40ms_frames() {
+        assert_plays_tone(include_bytes!("../tests/data/tone_40ms.bin"), 1920);
+    }
+
+    #[test]
+    fn plays_libopus_60ms_frames() {
+        assert_plays_tone(include_bytes!("../tests/data/tone_60ms.bin"), 2880);
+    }
+
+    #[test]
+    fn plays_libopus_120ms_frames() {
+        assert_plays_tone(include_bytes!("../tests/data/tone_120ms.bin"), 5760);
     }
 
     #[test]
